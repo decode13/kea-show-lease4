@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+
+# before running: apt install python3-mysql.connector python3-tabulate
+
+import string
+import json
+import re
+import mysql.connector
+import ipaddress
+from tabulate import tabulate
+from datetime import datetime
+import sys
+import argparse
+
+KEA_CONFIG_PATH = "/etc/kea/kea-dhcp4.conf"
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(description="Display Kea DHCP leases with optional subnet_id filter.")
+    parser.add_argument("--subnet-id", type=int, help="Filter leases by subnet ID")
+    return parser.parse_args()
+
+def parse_json_with_includes(file_path):
+    def include_file(match):
+        include_path = match.group(1)
+        try:
+            with open(include_path, 'r') as inc_file:
+                return inc_file.read()
+        except FileNotFoundError:
+            print(f"Warning: Included file not found: {include_path}")
+            return '""'  # Return empty JSON string to avoid syntax errors
+
+    try:
+        with open(file_path, 'r') as file:
+            content = file.read()
+    except FileNotFoundError:
+        print(f"Error: Kea configuration file not found: {file_path}")
+        sys.exit(1)
+    
+    # Replace includes with file contents
+    content = re.sub(r'<\?include "(.+?)"\?>', include_file, content)
+    
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError as e:
+        print(f"Error parsing JSON in {file_path}:")
+        print(f"JSONDecodeError: {e}")
+        print("Content after processing includes:")
+        print(content)
+        sys.exit(1)
+
+def get_db_config():
+    config = parse_json_with_includes(KEA_CONFIG_PATH)
+    try:
+        lease_db = config['Dhcp4']['lease-database']
+        # Check if lease-database is a dictionary (single config) or a list (multiple configs)
+        if isinstance(lease_db, list):
+            lease_db = lease_db[0]
+        return {
+            'host': lease_db.get('host', 'localhost'),
+            'database': lease_db['name'],
+            'user': lease_db['user'],
+            'password': lease_db['password']
+        }
+    except KeyError as e:
+        print(f"Error: Required database configuration not found in Kea config.")
+        print(f"Missing key: {e}")
+        sys.exit(1)
+
+def convert_decimal_ip(decimal_ip):
+    return str(ipaddress.IPv4Address(decimal_ip))
+
+def convert_to_cisco_mac(mac):
+    if isinstance(mac, str):
+        mac = mac.encode('utf-8')
+    mac = ''.join(f'{byte:02x}' for byte in mac)
+
+    if mac is None:
+        return "None"
+
+    if isinstance(mac, (bytes, bytearray)):
+        mac = mac.hex()
+    else:
+        mac = str(mac)
+
+    # Remove any non-hexadecimal characters
+    mac = ''.join(c for c in mac if c in '0123456789abcdefABCDEF').lower()
+
+    # Ensure the MAC address is 12 characters long
+    if len(mac) != 12:
+        return f"Invalid: {mac[0:4]}.{mac[4:8]}.{mac[8:12]}"
+
+    # Convert to Cisco format (groups of 4 digits)
+    return f"{mac[0:4]}.{mac[4:8]}.{mac[8:12]}"
+
+def format_client_id(client_id):
+    if client_id is None:
+        return "None"
+
+    if isinstance(client_id, str):
+        client_id = client_id.encode('utf-8')
+    client_id = ''.join(f'{byte:02x}' for byte in client_id)
+
+    if isinstance(client_id, (bytes, bytearray)):
+        client_id = client_id.hex()
+    else:
+        client_id = str(client_id)
+
+    # Remove any non-hexadecimal characters
+    client_id = ''.join(c for c in client_id if c in '0123456789abcdefABCDEF').lower()
+
+    # Ensure the MAC address is 12 characters long
+    if len(client_id) != 14:
+         return f"Invalid: {client_id[0:2]}.{client_id[2:6]}.{client_id[6:10]}.{client_id[10:14]}"
+
+    # Convert to Cisco format (groups of 2.4 digits)
+    return f"{client_id[0:2]}.{client_id[2:6]}.{client_id[6:10]}.{client_id[10:14]}"
+
+def get_leases(db_config, subnet_id=None):
+    try:
+        conn = mysql.connector.connect(**db_config)
+        cursor = conn.cursor(dictionary=True)
+        
+        query = """
+        SELECT address, hwaddr, client_id, valid_lifetime,
+               expire, subnet_id, fqdn_fwd, fqdn_rev, hostname
+        FROM lease4
+        """
+        
+        if subnet_id is not None:
+            query += " WHERE subnet_id = %s"
+            cursor.execute(query, (subnet_id,))
+        else:
+            cursor.execute(query)
+        
+        leases = cursor.fetchall()
+        
+        cursor.close()
+        conn.close()
+        
+        return leases
+    except mysql.connector.Error as e:
+        print(f"Error connecting to MySQL database: {e}")
+        sys.exit(1)
+
+def format_leases(leases):
+    formatted_leases = []
+    for lease in leases:
+        formatted_leases.append([
+            lease['subnet_id'],
+            convert_decimal_ip(lease['address']),
+            convert_to_cisco_mac(lease['hwaddr']),
+            lease['valid_lifetime'],
+            lease['expire'],
+            lease['hostname'],
+            format_client_id(lease['client_id'])
+        ])
+    return formatted_leases
+
+def main():
+    args = parse_arguments()
+    db_config = get_db_config()
+    leases = get_leases(db_config, args.subnet_id)
+    formatted_leases = format_leases(leases)
+
+    headers = ['Subnet ID', 'IP Address', 'MAC Address', 'Valid Lifetime', 'Expiration', 'Hostname', 'Client ID']
+    print(tabulate(formatted_leases, headers=headers, tablefmt="grid"))
+
+if __name__ == "__main__":
+    main()
+
