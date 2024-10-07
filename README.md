@@ -10,8 +10,8 @@ kea-show-lease4
 or you can filiter output using arguments:
 ```
   --subnet-id SUBNET_ID          Filter leases by subnet ID
-  --ip-address IP_ADDRESS        Filter leases by IP address (in dotted decimal format)
-  --mac-address MAC_ADDRESS      Filter leases by MAC address (in Cisco or colon-separated format)
+  --ip-address IP_ADDRESS        Filter leases by IP address
+  --mac-address MAC_ADDRESS      Filter leases by MAC address
   --config CONFIG                Path to Kea config file
   --output {display,json,csv}    Output format
 ```
