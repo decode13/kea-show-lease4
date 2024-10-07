@@ -1,58 +1,65 @@
 #!/usr/bin/env python3
 
-# before running: apt install python3-mysql.connector python3-tabulate
+#
+# Before running install: mysql.connector and tabulate
+# For Ubuntu: apt install python3-mysql.connector python3-tabulate
+#
 
-import string
 import json
 import re
 import mysql.connector
 import ipaddress
 from tabulate import tabulate
-from datetime import datetime
 import sys
 import argparse
+from typing import Dict, List, Optional, Any, Union
+from functools import lru_cache
+import csv
+from io import StringIO
 
 KEA_CONFIG_PATH = "/etc/kea/kea-dhcp4.conf"
 
-def parse_arguments():
-    parser = argparse.ArgumentParser(description="Display Kea DHCP leases with optional subnet_id filter.")
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Display Kea DHCP leases with optional filters.")
     parser.add_argument("--subnet-id", type=int, help="Filter leases by subnet ID")
+    parser.add_argument("--ip-address", help="Filter leases by IP address (in dotted decimal format)")
+    parser.add_argument("--mac-address", help="Filter leases by MAC address (in Cisco or colon-separated format)")
+    parser.add_argument("--config", default=KEA_CONFIG_PATH, help="Path to Kea config file")
+    parser.add_argument("--output", choices=['display', 'json', 'csv'], default='display', help="Output format")
     return parser.parse_args()
 
-def parse_json_with_includes(file_path):
+@lru_cache(maxsize=1)
+def parse_json_with_includes(file_path: str) -> Dict:
     def include_file(match):
         include_path = match.group(1)
         try:
             with open(include_path, 'r') as inc_file:
                 return inc_file.read()
         except FileNotFoundError:
-            print(f"Warning: Included file not found: {include_path}")
-            return '""'  # Return empty JSON string to avoid syntax errors
+            print(f"Warning: Included file not found: {include_path}", file=sys.stderr)
+            return '""'
 
     try:
         with open(file_path, 'r') as file:
             content = file.read()
     except FileNotFoundError:
-        print(f"Error: Kea configuration file not found: {file_path}")
+        print(f"Error: Kea configuration file not found: {file_path}", file=sys.stderr)
         sys.exit(1)
-    
-    # Replace includes with file contents
+
     content = re.sub(r'<\?include "(.+?)"\?>', include_file, content)
-    
+
     try:
         return json.loads(content)
     except json.JSONDecodeError as e:
-        print(f"Error parsing JSON in {file_path}:")
-        print(f"JSONDecodeError: {e}")
-        print("Content after processing includes:")
-        print(content)
+        print(f"Error parsing JSON in {file_path}:", file=sys.stderr)
+        print(f"JSONDecodeError: {e}", file=sys.stderr)
         sys.exit(1)
 
-def get_db_config():
-    config = parse_json_with_includes(KEA_CONFIG_PATH)
+
+def get_db_config(config_path: str) -> Dict[str, str]:
+    config = parse_json_with_includes(config_path)
     try:
         lease_db = config['Dhcp4']['lease-database']
-        # Check if lease-database is a dictionary (single config) or a list (multiple configs)
         if isinstance(lease_db, list):
             lease_db = lease_db[0]
         return {
@@ -62,90 +69,110 @@ def get_db_config():
             'password': lease_db['password']
         }
     except KeyError as e:
-        print(f"Error: Required database configuration not found in Kea config.")
-        print(f"Missing key: {e}")
+        print(f"Error: Required database configuration not found in Kea config.", file=sys.stderr)
+        print(f"Missing key: {e}", file=sys.stderr)
         sys.exit(1)
 
-def convert_decimal_ip(decimal_ip):
-    return str(ipaddress.IPv4Address(decimal_ip))
 
-def convert_to_cisco_mac(mac):
-    if isinstance(mac, str):
-        mac = mac.encode('utf-8')
-    mac = ''.join(f'{byte:02x}' for byte in mac)
+def ip_to_decimal(ip: str) -> int:
+    try:
+        return int(ipaddress.IPv4Address(ip))
+    except ipaddress.AddressValueError:
+        print(f"Error: Invalid IP address format: {ip}", file=sys.stderr)
+        sys.exit(1)
 
+
+def mac_to_bytes(mac: str) -> bytes:
+    mac = mac.replace(':', '').replace('.', '')
+    if len(mac) != 12:
+        print(f"Error: Invalid MAC address format: {mac}", file=sys.stderr)
+        sys.exit(1)
+    return bytes.fromhex(mac)
+
+
+def convert_decimal_ip(decimal_ip: int) -> str:
+    try:
+        return str(ipaddress.IPv4Address(decimal_ip))
+    except ValueError:
+        return f"Invalid IP: {decimal_ip}"
+
+
+def convert_to_cisco_mac(mac: Optional[bytes]) -> str:
     if mac is None:
         return "None"
 
-    if isinstance(mac, (bytes, bytearray)):
-        mac = mac.hex()
-    else:
-        mac = str(mac)
+    try:
+        if isinstance(mac, str):
+            mac = mac.encode('utf-8')
+        mac_str = ''.join(f'{byte:02x}' for byte in mac)
+        return f"{mac_str[0:4]}.{mac_str[4:8]}.{mac_str[8:12]}"
+    except Exception as e:
+        return f"Error converting MAC: {e}"
 
-    # Remove any non-hexadecimal characters
-    mac = ''.join(c for c in mac if c in '0123456789abcdefABCDEF').lower()
 
-    # Ensure the MAC address is 12 characters long
-    if len(mac) != 12:
-        return f"Invalid: {mac[0:4]}.{mac[4:8]}.{mac[8:12]}"
-
-    # Convert to Cisco format (groups of 4 digits)
-    return f"{mac[0:4]}.{mac[4:8]}.{mac[8:12]}"
-
-def format_client_id(client_id):
+def format_client_id(client_id: Optional[bytes]) -> str:
     if client_id is None:
         return "None"
 
-    if isinstance(client_id, str):
-        client_id = client_id.encode('utf-8')
-    client_id = ''.join(f'{byte:02x}' for byte in client_id)
+    try:
+        if isinstance(client_id, str):
+            client_id = client_id.encode('utf-8')
+        client_id = ''.join(f'{byte:02x}' for byte in client_id)
 
-    if isinstance(client_id, (bytes, bytearray)):
-        client_id = client_id.hex()
-    else:
-        client_id = str(client_id)
+        # Remove any non-hexadecimal characters
+        client_id = ''.join(c for c in client_id if c in '0123456789abcdefABCDEF').lower()
 
-    # Remove any non-hexadecimal characters
-    client_id = ''.join(c for c in client_id if c in '0123456789abcdefABCDEF').lower()
+        # Ensure the ClientID address is 14 characters long
+        if len(client_id) != 14:
+            return f"Invalid: {client_id[0:2]}.{client_id[2:6]}.{client_id[6:10]}.{client_id[10:14]}"
 
-    # Ensure the MAC address is 12 characters long
-    if len(client_id) != 14:
-         return f"Invalid: {client_id[0:2]}.{client_id[2:6]}.{client_id[6:10]}.{client_id[10:14]}"
+        # Convert to Cisco format (groups of 2.4.4.4 digits)
+        return f"{client_id[0:2]}.{client_id[2:6]}.{client_id[6:10]}.{client_id[10:14]}"
 
-    # Convert to Cisco format (groups of 2.4 digits)
-    return f"{client_id[0:2]}.{client_id[2:6]}.{client_id[6:10]}.{client_id[10:14]}"
+    except Exception as e:
+        return f"Error formatting client ID: {e}"
 
-def get_leases(db_config, subnet_id=None):
+
+def get_leases(db_config: Dict[str, str], subnet_id: Optional[int] = None,
+               ip_address: Optional[int] = None, mac_address: Optional[bytes] = None) -> List[Dict[str, Any]]:
     try:
         conn = mysql.connector.connect(**db_config)
         cursor = conn.cursor(dictionary=True)
-        
+
         query = """
         SELECT address, hwaddr, client_id, valid_lifetime,
                expire, subnet_id, fqdn_fwd, fqdn_rev, hostname
         FROM lease4
+        WHERE 1=1
         """
-        
+        params = []
+
         if subnet_id is not None:
-            query += " WHERE subnet_id = %s"
-            cursor.execute(query, (subnet_id,))
-        else:
-            cursor.execute(query)
-        
-        leases = cursor.fetchall()
-        
+            query += " AND subnet_id = %s"
+            params.append(subnet_id)
+
+        if ip_address is not None:
+            query += " AND address = %s"
+            params.append(ip_address)
+
+        if mac_address is not None:
+            query += " AND hwaddr = %s"
+            params.append(mac_address)
+
+        cursor.execute(query, params)
+        result = cursor.fetchall()
+
         cursor.close()
         conn.close()
-        
-        return leases
+
+        return result
     except mysql.connector.Error as e:
-        print(f"Error connecting to MySQL database: {e}")
+        print(f"Error connecting to MySQL database: {e}", file=sys.stderr)
         sys.exit(1)
 
-def format_leases(leases):
-    formatted_leases = []
-    for lease in leases:
-        formatted_leases.append([
+def format_leases(leases: List[Dict[str, Any]]) -> List[List[Any]]:
+    return [
+        [
             lease['subnet_id'],
             convert_decimal_ip(lease['address']),
             convert_to_cisco_mac(lease['hwaddr']),
@@ -153,18 +180,46 @@ def format_leases(leases):
             lease['expire'],
             lease['hostname'],
             format_client_id(lease['client_id'])
-        ])
-    return formatted_leases
+        ]
+        for lease in leases
+    ]
+
+
+def output_display(formatted_leases: List[List[Any]], headers: List[str]):
+    print(tabulate(formatted_leases, headers=headers, tablefmt="grid"))
+
+
+def output_json(formatted_leases: List[List[Any]], headers: List[str]):
+    json_data = [dict(zip(headers, lease)) for lease in formatted_leases]
+    print(json.dumps(json_data, indent=2))
+
+
+def output_csv(formatted_leases: List[List[Any]], headers: List[str]):
+    output = StringIO()
+    writer = csv.writer(output)
+    writer.writerow(headers)
+    writer.writerows(formatted_leases)
+    print(output.getvalue())
+
 
 def main():
     args = parse_arguments()
-    db_config = get_db_config()
-    leases = get_leases(db_config, args.subnet_id)
+    db_config = get_db_config(args.config)
+
+    ip_decimal = ip_to_decimal(args.ip_address) if args.ip_address else None
+    mac_bytes = mac_to_bytes(args.mac_address) if args.mac_address else None
+
+    leases = get_leases(db_config, args.subnet_id, ip_decimal, mac_bytes)
     formatted_leases = format_leases(leases)
 
     headers = ['Subnet ID', 'IP Address', 'MAC Address', 'Valid Lifetime', 'Expiration', 'Hostname', 'Client ID']
-    print(tabulate(formatted_leases, headers=headers, tablefmt="grid"))
+
+    if args.output == 'display':
+        output_display(formatted_leases, headers)
+    elif args.output == 'json':
+        output_json(formatted_leases, headers)
+    elif args.output == 'csv':
+        output_csv(formatted_leases, headers)
 
 if __name__ == "__main__":
     main()
-
